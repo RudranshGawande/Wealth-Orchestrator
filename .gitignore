@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 venv/
 output.csv
+.llm_cache.db

@@ -4,6 +4,10 @@ import logging
 import os
 import time
 from pathlib import Path
+import json
+import sqlite3
+import hashlib
+from pathlib import Path
 from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from google import genai
@@ -32,6 +36,49 @@ class LLMTracker:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.model_usage: Dict[str, Dict[str, int]] = {}
+        
+        self._api_quota_exceeded = False
+        self._api_key_invalid = False
+        
+        # Initialize SQLite Cache
+        self.cache_db_path = REPO_ROOT / ".llm_cache.db"
+        self._init_cache()
+
+    def _init_cache(self):
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS cache (prompt_hash TEXT PRIMARY KEY, response TEXT)"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to initialize SQLite cache: {e}")
+
+    def _get_cache_key(self, prompt: Any, model_name: str, config: Optional[Any]) -> str:
+        # Simple hash of the inputs
+        hash_input = f"{model_name}_{prompt}_{config}"
+        return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
+
+    def _get_cached_response(self, cache_key: str) -> Optional[str]:
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT response FROM cache WHERE prompt_hash = ?", (cache_key,))
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+        except Exception as e:
+            logger.warning(f"Cache read error: {e}")
+        return None
+
+    def _set_cached_response(self, cache_key: str, response_text: str):
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO cache (prompt_hash, response) VALUES (?, ?)",
+                    (cache_key, response_text)
+                )
+        except Exception as e:
+            logger.warning(f"Cache write error: {e}")
 
     def ask_gemini(
         self,
@@ -41,19 +88,23 @@ class LLMTracker:
     ) -> Optional[str]:
         """
         Calls the Gemini API with prompt (text or list of parts/images), tracks input/output tokens, and updates running totals.
-
-        Args:
-            prompt: Text prompt or list of content parts (e.g. [image_part, text_prompt]) to send.
-            model_name: Name of the Gemini model to use (default: gemini-3.6-flash).
-            config: Optional configuration object or dict (e.g. types.GenerateContentConfig).
-
-        Returns:
-            str: Generated text response from Gemini API.
         """
+        if self._api_quota_exceeded or self._api_key_invalid:
+            raise RuntimeError("API calls are currently disabled due to previous errors (Quota or Invalid Key).")
+
         if not self.client:
             raise ValueError(
                 "Gemini client is not initialized. Please set a valid GEMINI_API_KEY in .env."
             )
+            
+        cache_key = self._get_cache_key(prompt, model_name, config)
+        cached_response = self._get_cached_response(cache_key)
+        if cached_response is not None:
+            logger.info(f"Cache HIT for {model_name}")
+            return cached_response
+
+        # Request Throttling
+        time.sleep(1.5)
 
         max_retries = 1
         for attempt in range(max_retries + 1):
@@ -90,18 +141,17 @@ class LLMTracker:
                     f"API Call #{self.total_calls} [{model_name}]: "
                     f"Prompt Tokens={input_tokens}, Output Tokens={output_tokens}"
                 )
+                
+                self._set_cached_response(cache_key, response.text)
                 return response.text
 
             except Exception as e:
                 err_str = str(e)
-                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < max_retries:
-                    sleep_time = 2
-                    logger.warning(
-                        f"Rate limit 429 hit for {model_name}. Retrying in {sleep_time}s (Attempt {attempt+1}/{max_retries})..."
-                    )
-                    time.sleep(sleep_time)
-                    continue
-
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "404" in err_str:
+                    self._api_quota_exceeded = True
+                    logger.warning(f"Fatal API error (429/404) for {model_name}. Disabling further API calls.")
+                    raise
+                
                 logger.error(f"Failed Gemini API call to {model_name}: {e}")
                 raise
 

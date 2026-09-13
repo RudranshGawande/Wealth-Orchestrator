@@ -97,6 +97,10 @@ def process_missing_event_amounts(
             logger.warning(f"Image file not found: {image_file_path}")
             continue
 
+        if getattr(tracker, "_api_quota_exceeded", False) or getattr(tracker, "_api_key_invalid", False):
+            logger.info("Skipping remaining image extraction due to disabled API calls.")
+            break
+
         try:
             with open(image_file_path, "rb") as f:
                 image_bytes = f.read()
@@ -194,6 +198,10 @@ def process_message_amendments(
             continue
 
         user_prompt = f"{security_system_prompt}\n\nMessage Text:\n\"\"\"{msg_text}\"\"\""
+
+        if getattr(tracker, "_api_quota_exceeded", False) or getattr(tracker, "_api_key_invalid", False):
+            logger.info("Skipping remaining message parsing due to disabled API calls.")
+            break
 
         try:
             response_text = tracker.ask_gemini(user_prompt, model_name=model_name)
